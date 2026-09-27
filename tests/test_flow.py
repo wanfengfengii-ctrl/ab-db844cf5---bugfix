@@ -241,3 +241,43 @@ def test_cut_capacity_equals_max_flow_normal():
     # S→A 限 40，B→T 限 50，合计 90
     assert r["normal"]["max_flow"] == 90
     assert r["normal"]["cut"]["capacity"] == 90
+
+
+def test_huge_irrelevant_branch_does_not_change_audit():
+    """跨数量级的无关大容量支路不得改变可行配流的业务结论。
+
+    回归：S→T 唯一干线容量 1（不可检修），另有 S→X（死端汇合点）
+    容量 1e20 的无关支路。残余截断阈值曾按网络最大容量（1e20）缩放
+    到 1e8，把容量仅 1 的唯一干线当成零残余剪掉——最大流误算为 0、
+    审计误拒，而割集容量按原始容量求和仍为 1，流量/割证据互相矛盾。
+    无关支路不承载任何流量，不应产生任何舍入噪声，结论必须与不
+    存在该支路时一致：最大流 = 割集容量 = 1，放行。
+    """
+    edges = [
+        {"id": "E1", "from": "S", "to": "T", "capacity": 1, "maintainable": False},
+        {"id": "E2", "from": "S", "to": "X", "capacity": 1e20, "maintainable": False},
+    ]
+    r = audit_network(source="S", sink="T", nodes=["X"], edges=edges, required_flow=1)
+    assert r["passed"] is True
+    assert r["normal"]["max_flow"] == 1
+    assert r["normal"]["meets"] is True
+    cut = r["normal"]["cut"]
+    assert cut["capacity"] == 1  # 最大流 = 最小割，证据不再互相矛盾
+    assert [e["id"] for e in cut["cut_edges"]] == ["E1"]
+    assert "X" in cut["source_side_nodes"]
+    assert "T" in cut["sink_side_nodes"]
+    assert r["failure"] is None
+
+
+def test_huge_irrelevant_branch_does_not_mask_real_shortfall():
+    """无关大容量支路同样不得掩盖真实缺口：需求 2 时仍须判不达标。"""
+    edges = [
+        {"id": "E1", "from": "S", "to": "T", "capacity": 1, "maintainable": False},
+        {"id": "E2", "from": "S", "to": "X", "capacity": 1e20, "maintainable": False},
+    ]
+    r = audit_network(source="S", sink="T", nodes=["X"], edges=edges, required_flow=2)
+    assert r["passed"] is False
+    assert r["normal"]["max_flow"] == 1
+    assert r["failure"]["stage"] == "normal"
+    assert r["failure"]["max_flow"] == 1
+    assert r["failure"]["cut"]["capacity"] == 1

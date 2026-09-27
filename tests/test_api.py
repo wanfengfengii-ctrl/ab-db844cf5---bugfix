@@ -263,3 +263,48 @@ def test_plan_non_json_body_400():
     r = client.post("/api/plan", content=b"not-json",
                     headers={"Content-Type": "application/json"})
     assert r.status_code == 400
+
+
+def test_plan_huge_irrelevant_branch_still_passes():
+    """无关的跨数量级大容量支路（S→X，1e20）不得拒绝可行草稿。
+
+    回归：唯一通向 T 的管段 S→T（容量 1）曾被按 1e20 缩放的截断
+    阈值误剪，导致 passed=false、plans=null、最大流 0 而割集容量 1。
+    修复后 HTTP 200、passed=true，仅含正常情形，最大流/割集容量/
+    flow_value/S→T 管段流量/总代价均为 1。
+    """
+    payload = {
+        "source": "S",
+        "sink": "T",
+        "required_flow": 1,
+        "nodes": ["X"],
+        "edges": [
+            {"id": "E1", "from": "S", "to": "T", "capacity": 1,
+             "maintainable": False, "cost": 1},
+            {"id": "E2", "from": "S", "to": "X", "capacity": 1e20,
+             "maintainable": False, "cost": 0},
+        ],
+    }
+    r = client.post("/api/plan", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["passed"] is True
+    assert body["audit"]["normal"]["max_flow"] == 1
+    assert body["audit"]["normal"]["cut"]["capacity"] == 1
+    plans = body["plans"]
+    assert len(plans) == 1
+    plan = plans[0]
+    assert plan["scenario"] == 0 and plan["removed"] is None
+    assert plan["flow_value"] == 1
+    assert [f["flow"] for f in plan["flows"]] == [1, 0]
+    assert plan["total_cost"] == 1
+    # 同一草稿在 /api/audit 上同样放行，流量与割证据一致
+    r2 = client.post("/api/audit", json={
+        k: ([{ek: ev for ek, ev in e.items() if ek != "cost"} for e in v]
+            if k == "edges" else v)
+        for k, v in payload.items()
+    })
+    audit = r2.json()
+    assert audit["passed"] is True
+    assert audit["normal"]["max_flow"] == 1
+    assert audit["normal"]["cut"]["capacity"] == 1

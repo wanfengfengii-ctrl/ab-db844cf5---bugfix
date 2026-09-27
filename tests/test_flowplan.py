@@ -329,6 +329,41 @@ def test_tiny_flow_not_zeroed_even_beside_huge_capacity():
     assert r["plans"][0]["total_cost"] == 5e-10
 
 
+def test_huge_irrelevant_branch_does_not_change_plan():
+    """跨数量级的无关大容量支路不得改变唯一可行配流的业务结论。
+
+    回归：S→T 唯一干线容量 1、代价 1（不可检修），S→X（死端汇合点）
+    容量 1e20、代价 0 的无关支路曾把审计截断阈值抬到 1e8，唯一干线
+    被当成零残余剪掉——最大流误算为 0（割集容量却为 1），可行草稿
+    被拒（passed=false、plans=null）。修复后应放行并给出唯一配流：
+    仅含正常情形，最大流 / 割集容量 / 总流量 / S→T 管段流量 / 总代价
+    均为 1，无关支路流量为 0。
+    """
+    kw = {
+        "source": "S", "sink": "T", "required_flow": 1, "nodes": ["X"],
+        "edges": [
+            {"id": "E1", "from": "S", "to": "T", "capacity": 1,
+             "maintainable": False, "cost": 1},
+            {"id": "E2", "from": "S", "to": "X", "capacity": 1e20,
+             "maintainable": False, "cost": 0},
+        ],
+    }
+    r = plan_low_exposure(**kw)
+    assert r["passed"] is True
+    # 内嵌审计同样不再自相矛盾：最大流 = 割集容量 = 1
+    assert r["audit"]["passed"] is True
+    assert r["audit"]["normal"]["max_flow"] == 1
+    assert r["audit"]["normal"]["cut"]["capacity"] == 1
+    # 两条管段均不可检修：仅含正常情形（情形 0）一张配流单
+    assert len(r["plans"]) == 1
+    plan = r["plans"][0]
+    assert plan["scenario"] == 0 and plan["removed"] is None
+    flows = _assert_feasible(plan, kw["edges"], 1)
+    assert flows == [1, 0]  # 唯一可行配流：全部走 S→T 干线
+    assert plan["flow_value"] == 1
+    assert plan["total_cost"] == 1
+
+
 def test_integer_valued_float_cost_accepted():
     r = plan_low_exposure(
         source="S", sink="T", nodes=[],

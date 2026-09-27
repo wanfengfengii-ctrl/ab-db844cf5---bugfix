@@ -288,15 +288,34 @@ def audit_validated_draft(draft: dict) -> dict:
     def _solve(removed_index: Optional[int]) -> tuple[float, dict]:
         """在一张**全新**的网络上独立求最大流，并返回流量与最小割证据。"""
         active = [e for e in clean_edges if e["index"] != removed_index]
-        # 截断阈值按当前网络的流量规模（需求与容量的最大量级）缩放，
-        # 使 5e-10 这类合法微小网络的真实残余容量不会被绝对阈值抹掉。
-        scale = max([required_flow] + [e["capacity"] for e in active])
-        tol = residual_tolerance(scale)
-        dinic = Dinic(len(all_nodes), tol)
-        for e in active:
-            dinic.add_edge(index_of[e["from"]], index_of[e["to"]], e["capacity"])
-        value = dinic.max_flow(index_of[source], index_of[sink])
-        side = dinic.reachable_from_source(index_of[source])
+        src_idx, sink_idx = index_of[source], index_of[sink]
+
+        def _build(tol: float) -> Dinic:
+            dinic = Dinic(len(all_nodes), tol)
+            for e in active:
+                dinic.add_edge(index_of[e["from"]], index_of[e["to"]], e["capacity"])
+            return dinic
+
+        # 截断阈值必须按**实际推送流量**的量级缩放，而非网络中最大管段
+        # 容量：残余容量的浮点舍入噪声只来自真实发生的推送（量级不超过
+        # 最大流本身），一条不承载任何流量的无关管段不会带来任何噪声。
+        # 历史上按 max(需求, 全部容量) 取规模：一条容量 1e20 的无关支路
+        # （如 S→死端汇合点 X）会把 tol 抬到 1e8，把容量仅 1 的唯一
+        # S→T 干线在 BFS 中当成零残余剪掉——最大流被误算为 0，而割集
+        # 容量按原始容量求和仍为 1，出现互相矛盾的流量/割证据。
+        #
+        # 真实最大流事先未知，故先以必须持续排出量为规模求解；若实际
+        # 最大流超出该量级（如需求 95、真实可导 200），再在全新网络上
+        # 按实测流量重新求解一次，使截断阈值与真实舍入噪声匹配。粗阈值
+        # 只会剪掉更多弧，重解结果不可能大于首轮结果，因此至多重解一次。
+        scale = required_flow
+        dinic = _build(residual_tolerance(scale))
+        value = dinic.max_flow(src_idx, sink_idx)
+        if value > scale + dinic.tol:
+            scale = value
+            dinic = _build(residual_tolerance(scale))
+            value = dinic.max_flow(src_idx, sink_idx)
+        side = dinic.reachable_from_source(src_idx)
 
         source_side = sorted(all_nodes[k] for k, ok in enumerate(side) if ok)
         sink_side = sorted(all_nodes[k] for k, ok in enumerate(side) if not ok)

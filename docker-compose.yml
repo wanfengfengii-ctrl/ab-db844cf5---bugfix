@@ -1,0 +1,27 @@
+services:
+  # 常驻审计 Web 服务
+  web:
+    build: .
+    image: flare-audit:latest
+    container_name: flare-audit-web
+    # 宿主机端口可配置：WEB_HOST_PORT=9090 docker compose up -d
+    ports:
+      - "${WEB_HOST_PORT:-8080}:8000"
+    environment:
+      - UVICORN_PORT=8000
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=5); sys.exit(0 if json.load(r)['status']=='ok' else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # 一次性交付校验：代码测试 + 构建检查 + 导排 API 冒烟，
+  # 自行退出并以退出码报告结果（0 全部通过，非 0 存在失败）。
+  verify:
+    build: .
+    image: flare-audit:latest
+    container_name: flare-audit-verify
+    command: ["python", "scripts/verify"]
+    restart: "no"

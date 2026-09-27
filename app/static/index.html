@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>事故导排网络检修审计</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="wrap">
+    <h1>化工园区事故导排网络 · 检修前审计</h1>
+    <p class="sub">泄压源 → 汇合节点 → 安全焚烧端；正常网络与每条可检修管段临时失效后的残余网络均独立计算<strong>最大可导排量</strong>，全部达标方可放行。</p>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- ============ 一、当前输入（草稿） ============ -->
+  <section class="card" id="draft-card">
+    <div class="card-head">
+      <h2>① 当前输入（草稿）</h2>
+      <div class="head-actions">
+        <button type="button" class="btn ghost" id="btn-example-pass">载入达标示例</button>
+        <button type="button" class="btn ghost" id="btn-example-fail">载入失效示例</button>
+        <button type="button" class="btn ghost" id="btn-clear">清空</button>
+      </div>
+    </div>
+
+    <div class="grid3">
+      <label>泄压源节点
+        <input id="in-source" type="text" placeholder="如：泄压源V-101" />
+      </label>
+      <label>安全焚烧端节点
+        <input id="in-sink" type="text" placeholder="如：焚烧炉F-1" />
+      </label>
+      <label>事故时必须持续排出的流量
+        <input id="in-required" type="number" min="0" step="any" placeholder="如：100（m³/h）" />
+      </label>
+    </div>
+
+    <div class="block">
+      <div class="row-between">
+        <h3>汇合节点</h3>
+        <button type="button" class="btn small" id="btn-add-node">＋ 添加汇合节点</button>
+      </div>
+      <div id="nodes-list" class="nodes-list"></div>
+    </div>
+
+    <div class="block">
+      <div class="row-between">
+        <h3>管段（录入顺序即失效判定顺序）</h3>
+        <button type="button" class="btn small" id="btn-add-edge">＋ 添加管段</button>
+      </div>
+      <div class="table-scroll">
+        <table class="edge-table">
+          <thead>
+            <tr>
+              <th style="width:42px">#</th>
+              <th>管段编号(选填)</th>
+              <th>起点</th>
+              <th>方向</th>
+              <th>终点</th>
+              <th>最大流量(容量上限)</th>
+              <th>单位暴露代价<br/><span class="tip">非负整数</span></th>
+              <th class="center">可检修<br/><span class="tip">临时失效模拟</span></th>
+              <th style="width:48px"></th>
+            </tr>
+          </thead>
+          <tbody id="edges-body"></tbody>
+        </table>
+      </div>
+      <p class="tip">容量按管段<strong>上限</strong>参与最大流计算；方向不可逆向。未勾选“可检修”的管段不参与单段失效模拟。<strong>单位暴露代价</strong>为每单位流量穿过该管段的暴露代价，须为非负整数，仅用于生成低暴露配流单。</p>
+    </div>
+
+    <div class="submit-row">
+      <button type="button" class="btn primary" id="btn-audit">提交审计</button>
+      <button type="button" class="btn" id="btn-plan">生成低暴露配流单</button>
+      <span id="draft-hint" class="tip"></span>
+    </div>
+  </section>
+
+  <!-- ============ 输入被拒绝（400，未产生结论） ============ -->
+  <section class="card hidden" id="reject-card">
+    <h2 class="reject">输入被拒绝 —— 未产生审计结论</h2>
+    <p id="reject-msg" class="reject-msg"></p>
+    <p class="tip">请按提示修正草稿后重新提交。此条信息不是审计结论。</p>
+  </section>
+
+  <!-- ============ 审计结论 ============ -->
+  <section class="card hidden" id="result-card">
+    <div class="stale-banner hidden" id="stale-banner">
+      ⚠ 草稿在上次审计之后已被修改，以下为<strong>旧结论</strong>，不代表当前草稿；请重新提交审计。
+    </div>
+
+    <!-- 通过 -->
+    <div id="pass-panel" class="hidden">
+      <div class="verdict pass">
+        <span class="badge pass">✔ 审计通过，允许放行检修</span>
+        <p>正常网络及全部 <strong id="pass-scenario-count"></strong> 条可检修管段逐条临时失效后，最大可导排量均不低于事故要求
+          <strong id="pass-required"></strong>。</p>
+      </div>
+    </div>
+
+    <!-- 失败 -->
+    <div id="fail-panel" class="hidden">
+      <div class="verdict fail">
+        <span class="badge fail">✘ 审计不通过，禁止放行</span>
+        <p>按管段录入顺序，首条不达标管段为
+          <strong id="fail-edge"></strong>，其临时失效后最大可导排量
+          <strong id="fail-flow"></strong> 低于事故要求 <strong id="fail-required"></strong>。</p>
+      </div>
+
+      <div class="evidence">
+        <h2>② 失败证据（可复核的最小割）</h2>
+        <p class="tip">依据最大流 / 最小割定理：该失效情景下的最大可导排量，恰好等于把网络分隔为“源侧 / 焚烧端侧”两部分的最小割集容量。沿源侧指向焚烧端侧的割管段容量之和即为瓶颈。</p>
+        <div class="cut-grid">
+          <div>
+            <h3>源侧割集节点（含泄压源）</h3>
+            <div id="cut-source-side" class="chips"></div>
+          </div>
+          <div>
+            <h3>焚烧端侧节点（含安全焚烧端）</h3>
+            <div id="cut-sink-side" class="chips"></div>
+          </div>
+        </div>
+        <h3>割集管段（源侧 → 焚烧端侧）</h3>
+        <div class="table-scroll">
+          <table class="cut-table">
+            <thead><tr><th>#</th><th>管段编号</th><th>源侧节点</th><th>方向</th><th>焚烧端侧节点</th><th>容量</th></tr></thead>
+            <tbody id="cut-edges-body"></tbody>
+            <tfoot><tr><td colspan="5" class="right">割集容量（＝该情景最大可导排量）</td><td id="cut-capacity" class="strong"></td></tr></tfoot>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- 正常网络 -->
+    <div class="block">
+      <h2>③ 正常网络（无管段失效）</h2>
+      <div class="metric-row">
+        <div class="metric">
+          <span class="metric-label">最大可导排量</span>
+          <span class="metric-value" id="normal-flow"></span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">事故要求流量</span>
+          <span class="metric-value" id="normal-required"></span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">判定</span>
+          <span class="metric-value" id="normal-meets"></span>
+        </div>
+      </div>
+      <details class="cut-detail">
+        <summary>查看正常网络最小割（源侧 / 焚烧端侧 / 割集管段）</summary>
+        <div class="cut-grid">
+          <div><h3>源侧节点</h3><div id="normal-cut-source" class="chips"></div></div>
+          <div><h3>焚烧端侧节点</h3><div id="normal-cut-sink" class="chips"></div></div>
+        </div>
+        <div class="table-scroll">
+          <table class="cut-table">
+            <thead><tr><th>#</th><th>管段编号</th><th>方向</th><th>容量</th></tr></thead>
+            <tbody id="normal-cut-edges"></tbody>
+            <tfoot><tr><td colspan="3" class="right">割集容量</td><td id="normal-cut-capacity" class="strong"></td></tr></tfoot>
+          </table>
+        </div>
+      </details>
+    </div>
+
+    <!-- 逐条失效情形 -->
+    <div class="block">
+      <h2>④ 逐条管段临时失效情形的最大可导排量</h2>
+      <div class="table-scroll">
+        <table class="scenario-table">
+          <thead>
+            <tr><th>顺序</th><th>失效管段</th><th>方向</th><th>管段容量</th><th>失效后最大可导排量</th><th>事故要求</th><th>判定</th></tr>
+          </thead>
+          <tbody id="scenarios-body"></tbody>
+        </table>
+      </div>
+      <p id="non-maintainable-note" class="tip hidden"></p>
+    </div>
+  </section>
+
+  <!-- ============ 低暴露配流单 ============ -->
+  <section class="card hidden" id="plan-card">
+    <div class="stale-banner hidden" id="plan-stale-banner">
+      ⚠ 草稿或单位暴露代价在上次生成之后已被修改，以下为<strong>旧配流单</strong>，已失效；请重新生成低暴露配流单。
+    </div>
+
+    <h2>⑤ 低暴露配流单（事故泄压配流）</h2>
+    <p class="tip">服务端已按既有规则重新审计当前草稿；在<strong>正常网络</strong>与<strong>每条可检修管段单独失效后的残余网络</strong>中，分别分配恰好等于事故必须持续排出量的流量（被移除管段流量固定为零）。所有满足方向、容量与汇合节点守恒的配流中，先取<strong>总代价最低</strong>，再按管段录入顺序的流量序列字典序决胜。</p>
+
+    <div id="plan-blocked" class="verdict fail hidden">
+      <span class="badge fail">✘ 草稿未放行，不生成配流单</span>
+      <p>当前草稿未通过检修审计，低暴露配流单不予生成；首条失效管段与割集证据见上方审计结论。</p>
+    </div>
+
+    <div id="plan-summary" class="hidden">
+      <div class="metric-row">
+        <div class="metric">
+          <span class="metric-label">事故必须持续排出量</span>
+          <span class="metric-value" id="plan-required"></span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">情形数量</span>
+          <span class="metric-value" id="plan-count"></span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">正常网络最低总代价</span>
+          <span class="metric-value" id="plan-normal-cost"></span>
+        </div>
+      </div>
+      <div id="plan-scenarios"></div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="wrap">
+  <p class="tip">结论来自服务端业务 API <code>POST /api/audit</code>（Dinic 最大流 + 残余网络最小割）与 <code>POST /api/plan</code>（最小费用流 + 字典序决胜），前端不做流量结论计算。</p>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

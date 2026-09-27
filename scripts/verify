@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""Compose 中 verify 一次性服务的入口。
+
+按顺序执行三类交付校验，任一步失败即以非零退出码报告：
+
+  1. 代码测试：pytest 测试套件（最大流/最小割、校验、配流、API）；
+  2. 构建：字节码编译 + FastAPI 应用导入（确保可启动）；
+  3. 导排 API 冒烟：真实拉起 uvicorn，调用 /health、/api/audit 与
+     /api/plan，覆盖达标放行、失效证据（首条失效管段 + 最小割）、
+     低暴露配流（各情形流量/总代价/情形编号、被移除管段零流量）、
+     合法微小管段（容量 / 需求均为 5e-10）放行且保留非零最大流 /
+     割集 / 配流、微小容量缺口（需求 100.0000000005、单干线仅 100，
+     缺口小于算法容差）不得放行、非法输入 400。
+"""
+from __future__ import annotations
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+EPS = 1e-6
+
+PAYLOAD_PASS = {
+    "source": "泄压源V-101",
+    "sink": "焚烧炉F-1",
+    "required_flow": 95,
+    "nodes": ["汇合点A", "汇合点B"],
+    "edges": [
+        {"id": "E1", "from": "泄压源V-101", "to": "汇合点A", "capacity": 100, "maintainable": True},
+        {"id": "E2", "from": "汇合点A", "to": "焚烧炉F-1", "capacity": 100, "maintainable": True},
+        {"id": "E3", "from": "泄压源V-101", "to": "汇合点B", "capacity": 100, "maintainable": True},
+        {"id": "E4", "from": "汇合点B", "to": "焚烧炉F-1", "capacity": 100, "maintainable": True},
+    ],
+}
+
+PAYLOAD_FAIL = {
+    "source": "泄压源V-101",
+    "sink": "焚烧炉F-1",
+    "required_flow": 95,
+    "nodes": ["汇合点A", "汇合点B"],
+    "edges": [
+        {"id": "E1", "from": "泄压源V-101", "to": "汇合点A", "capacity": 100, "maintainable": True},
+        {"id": "E2", "from": "汇合点A", "to": "焚烧炉F-1", "capacity": 100, "maintainable": True},
+        {"id": "E3", "from": "泄压源V-101", "to": "汇合点B", "capacity": 90, "maintainable": True},
+        {"id": "E4", "from": "汇合点B", "to": "焚烧炉F-1", "capacity": 90, "maintainable": True},
+    ],
+}
+
+PAYLOAD_INVALID = {
+    "source": "S",
+    "sink": "T",
+    "required_flow": 10,
+    "nodes": [],
+    "edges": [{"id": "X", "from": "S", "to": "幽灵节点", "capacity": 10, "maintainable": True}],
+}
+
+# 低暴露配流：B 干线单位暴露代价更低（1），A 干线更高（2）
+PAYLOAD_PLAN = {
+    "source": "泄压源V-101",
+    "sink": "焚烧炉F-1",
+    "required_flow": 95,
+    "nodes": ["汇合点A", "汇合点B"],
+    "edges": [
+        {"id": "E1", "from": "泄压源V-101", "to": "汇合点A", "capacity": 100, "maintainable": True, "cost": 2},
+        {"id": "E2", "from": "汇合点A", "to": "焚烧炉F-1", "capacity": 100, "maintainable": True, "cost": 2},
+        {"id": "E3", "from": "泄压源V-101", "to": "汇合点B", "capacity": 100, "maintainable": True, "cost": 1},
+        {"id": "E4", "from": "汇合点B", "to": "焚烧炉F-1", "capacity": 100, "maintainable": True, "cost": 1},
+    ],
+}
+
+# 等代价并联：用于验证字典序稳定决胜（排在前面的管段尽量少承担）
+PAYLOAD_PLAN_TIE = {
+    "source": "S",
+    "sink": "T",
+    "required_flow": 50,
+    "nodes": [],
+    "edges": [
+        {"id": "E1", "from": "S", "to": "T", "capacity": 100, "maintainable": False, "cost": 5},
+        {"id": "E2", "from": "S", "to": "T", "capacity": 100, "maintainable": False, "cost": 5},
+    ],
+}
+
+# 合法微小管段：无中间节点、单条不可检修管段，容量与需求均为 5e-10。
+# 唯一可行配流即该管段输送 5e-10；最大流 / 割集 / 配流都必须保留非零值。
+PAYLOAD_TINY_PLAN = {
+    "source": "S",
+    "sink": "T",
+    "required_flow": 5e-10,
+    "nodes": [],
+    "edges": [
+        {"id": "E1", "from": "S", "to": "T", "capacity": 5e-10, "maintainable": False, "cost": 1},
+    ],
+}
+PAYLOAD_TINY_AUDIT = {
+    k: [
+        {ek: ev for ek, ev in e.items() if ek != "cost"}
+        for e in PAYLOAD_TINY_PLAN["edges"]
+    ]
+    if k == "edges" else v
+    for k, v in PAYLOAD_TINY_PLAN.items()
+}
+
+# 代价非法（非负整数约束）
+PAYLOAD_PLAN_BAD_COST = {
+    "source": "S",
+    "sink": "T",
+    "required_flow": 10,
+    "nodes": [],
+    "edges": [{"id": "X", "from": "S", "to": "T", "capacity": 10, "maintainable": True, "cost": 2.5}],
+}
+
+# 微小但真实的容量缺口：两条 100 干线并联，需求 100.0000000005；
+# 任一单管段失效后只剩一条 100 干线，严格小于需求，绝不能被容差放行。
+PAYLOAD_MICRO_GAP_PLAN = {
+    "source": "S",
+    "sink": "T",
+    "required_flow": 100.0000000005,
+    "nodes": ["A", "B"],
+    "edges": [
+        {"id": "E1", "from": "S", "to": "A", "capacity": 100, "maintainable": True, "cost": 1},
+        {"id": "E2", "from": "A", "to": "T", "capacity": 100, "maintainable": True, "cost": 1},
+        {"id": "E3", "from": "S", "to": "B", "capacity": 100, "maintainable": True, "cost": 1},
+        {"id": "E4", "from": "B", "to": "T", "capacity": 100, "maintainable": True, "cost": 1},
+    ],
+}
+PAYLOAD_MICRO_GAP_AUDIT = {
+    k: [
+        {ek: ev for ek, ev in e.items() if ek != "cost"}
+        for e in PAYLOAD_MICRO_GAP_PLAN["edges"]
+    ]
+    if k == "edges" else v
+    for k, v in PAYLOAD_MICRO_GAP_PLAN.items()
+}
+
+
+def _log(ok: bool, title: str, detail: str = "") -> None:
+    mark = "PASS" if ok else "FAIL"
+    print(f"[{mark}] {title}" + (f"\n       {detail}" if detail else ""), flush=True)
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def run_tests() -> bool:
+    print("\n=== 1/3 代码测试 (pytest) ===", flush=True)
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "tests"],
+        cwd=ROOT,
+    )
+    _log(proc.returncode == 0, "pytest 测试套件", f"exit={proc.returncode}")
+    return proc.returncode == 0
+
+
+def run_build() -> bool:
+    print("\n=== 2/3 构建检查 ===", flush=True)
+    ok = True
+    proc = subprocess.run(
+        [sys.executable, "-m", "compileall", "-q", "app"],
+        cwd=ROOT,
+    )
+    compile_ok = proc.returncode == 0
+    _log(compile_ok, "字节码编译 compileall", f"exit={proc.returncode}")
+    ok &= compile_ok
+
+    # 导入应用即保证 FastAPI 路由可装配、容器启动不会在导入期崩溃。
+    proc = subprocess.run(
+        [sys.executable, "-c", "from app.main import app; print(sorted(r.path for r in app.routes))"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    import_ok = (
+        proc.returncode == 0
+        and "/api/audit" in proc.stdout
+        and "/api/plan" in proc.stdout
+        and "/health" in proc.stdout
+    )
+    _log(import_ok, "FastAPI 应用导入与路由装配", proc.stderr.strip()[-400:] if not import_ok else "")
+    return ok and import_ok
+
+
+def _request(method: str, url: str, payload=None):
+    data = None
+    headers = {}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode("utf-8"))
+
+
+def run_smoke() -> bool:
+    print("\n=== 3/3 导排 API 冒烟 (真实 uvicorn) ===", flush=True)
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    env = dict(os.environ, PYTHONPATH=str(ROOT))
+    server = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "app.main:app",
+         "--host", "127.0.0.1", "--port", str(port), "--log-level", "warning"],
+        cwd=ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    ok = True
+    try:
+        # 等待健康检查通过
+        healthy = False
+        for _ in range(60):
+            if server.poll() is not None:
+                out = server.stdout.read() if server.stdout else ""
+                _log(False, "uvicorn 启动", f"进程提前退出\n{out[-800:]}")
+                return False
+            try:
+                status, body = _request("GET", f"{base}/health")
+                if status == 200 and body.get("status") == "ok":
+                    healthy = True
+                    break
+            except Exception:
+                time.sleep(0.5)
+        _log(healthy, "GET /health 健康检查")
+        ok &= healthy
+        if not healthy:
+            return False
+
+        # 达标情景：正常 200，单管段失效后仍有一条 100 干线
+        status, body = _request("POST", f"{base}/api/audit", PAYLOAD_PASS)
+        pass_ok = (
+            status == 200
+            and body.get("passed") is True
+            and body["normal"]["max_flow"] == 200
+            and len(body["scenarios"]) == 4
+            and all(s["max_flow"] == 100 and s["meets"] for s in body["scenarios"])
+        )
+        _log(pass_ok, "达标网络审计放行 (正常=200，任一干线失效=100≥95)",
+             "" if pass_ok else json.dumps(body, ensure_ascii=False)[:600])
+        ok &= pass_ok
+
+        # 失效情景：首条不达标为录入顺序第 1 条，最小割可复核
+        status, body = _request("POST", f"{base}/api/audit", PAYLOAD_FAIL)
+        f = body.get("failure") or {}
+        cut = f.get("cut") or {}
+        fail_ok = (
+            status == 200
+            and body.get("passed") is False
+            and f.get("position") == 1
+            and f.get("max_flow") == 90
+            and abs(cut.get("capacity", -1) - f.get("max_flow", -2)) < EPS  # 最大流=最小割
+            and PAYLOAD_FAIL["source"] in cut.get("source_side_nodes", [])
+            and PAYLOAD_FAIL["sink"] in cut.get("sink_side_nodes", [])
+            and len(cut.get("cut_edges", [])) >= 1
+        )
+        _log(fail_ok, "失效网络返回首条失效管段(顺序#1)与最小割证据(割容量=90=最大流)",
+             "" if fail_ok else json.dumps(body, ensure_ascii=False)[:600])
+        ok &= fail_ok
+
+        # 非法节点引用必须被拒绝
+        status, body = _request("POST", f"{base}/api/audit", PAYLOAD_INVALID)
+        invalid_ok = status == 400 and bool(body.get("error"))
+        _log(invalid_ok, f"节点引用无效返回 400（实际 HTTP {status}：{body.get('error', '')}）")
+        ok &= invalid_ok
+
+        # 低暴露配流单：达标网络逐情形配流（低代价干线优先、被移除管段零流量）
+        status, body = _request("POST", f"{base}/api/plan", PAYLOAD_PLAN)
+        plans = body.get("plans") or []
+        plan_ok = (
+            status == 200
+            and body.get("passed") is True
+            and body.get("audit", {}).get("passed") is True
+            and [p.get("scenario") for p in plans] == [0, 1, 2, 3, 4]
+            and all(p.get("flow_value") == 95 for p in plans)
+            # 正常网络全部走低暴露 B 干线（E3/E4，单位代价 1），总代价 190
+            and [f["flow"] for f in plans[0]["flows"]] == [0, 0, 95, 95]
+            and plans[0]["total_cost"] == 190
+            # 情形 1：E1 被移除，流量固定为零
+            and plans[1]["flows"][0]["flow"] == 0
+            and plans[1]["flows"][0]["removed"] is True
+            and plans[1]["removed"]["position"] == 1
+            # 每种情形总代价 = Σ 流量 × 单位暴露代价
+            and all(
+                p["total_cost"] == sum(f["flow"] * f["cost"] for f in p["flows"])
+                for p in plans
+            )
+        )
+        _log(plan_ok, "低暴露配流单：逐情形配流（情形 0..4、低代价优先、移除管段零流量）",
+             "" if plan_ok else json.dumps(body, ensure_ascii=False)[:600])
+        ok &= plan_ok
+
+        # 字典序稳定决胜：等代价并联时排在前面的管段尽量少承担
+        status, body = _request("POST", f"{base}/api/plan", PAYLOAD_PLAN_TIE)
+        tie_ok = (
+            status == 200
+            and body.get("passed") is True
+            and [f["flow"] for f in body["plans"][0]["flows"]] == [0, 50]
+            and body["plans"][0]["total_cost"] == 250
+        )
+        _log(tie_ok, "字典序稳定决胜（等代价并联 [0, 50]，总代价 250）",
+             "" if tie_ok else json.dumps(body, ensure_ascii=False)[:600])
+        ok &= tie_ok
+
+        # 审计不放行：不生成配流单，仍返回首条失效管段与割集证据
+        status, body = _request("POST", f"{base}/api/plan", PAYLOAD_FAIL | {
+            "edges": [dict(e, cost=1) for e in PAYLOAD_FAIL["edges"]]
+        })
+        blocked_ok = (
+            status == 200
+            and body.get("passed") is False
+            and body.get("plans") is None
+            and body.get("audit", {}).get("failure", {}).get("position") == 1
+            and body["audit"]["failure"]["cut"]["capacity"] == 90
+        )
+        _log(blocked_ok, "草稿不放行时不生成配流单（保留首条失效管段与割集证据）",
+             "" if blocked_ok else json.dumps(body, ensure_ascii=False)[:600])
+        ok &= blocked_ok
+
+        # 微小容量缺口（5e-10 < 算法容差）必须真实判不达标，审计与配流均不放行
+        status, body = _request("POST", f"{base}/api/audit", PAYLOAD_MICRO_GAP_AUDIT)
+        f = body.get("failure") or {}
+        audit_gap_ok = (
+            status == 200
+            and body.get("passed") is False
+            and f.get("position") == 1
+            and f.get("max_flow") == 100
+            and f.get("cut", {}).get("capacity") == 100
+        )
+        _log(audit_gap_ok, "微小容量缺口（需求 100.0000000005，单干线 100）审计不放行",
+             "" if audit_gap_ok else json.dumps(body, ensure_ascii=False)[:600])
+        ok &= audit_gap_ok
+
+        status, body = _request("POST", f"{base}/api/plan", PAYLOAD_MICRO_GAP_PLAN)
+        plan_gap_ok = (
+            status == 200
+            and body.get("passed") is False
+            and body.get("plans") is None
+            and body.get("audit", {}).get("failure", {}).get("position") == 1
+            and body["audit"]["failure"]["cut"]["capacity"] == 100
+        )
+        _log(plan_gap_ok, "微小容量缺口不生成配流单（passed=false、plans=null、保留割集）",
+             "" if plan_gap_ok else json.dumps(body, ensure_ascii=False)[:600])
+        ok &= plan_gap_ok
+
+        # 合法微小管段（容量 / 需求均为 5e-10）必须放行，且最大流、割集容量、
+        # 总流量、管段流量与总代价都保留 5e-10 这一真实非零值
+        status, body = _request("POST", f"{base}/api/audit", PAYLOAD_TINY_AUDIT)
+        tiny_audit_ok = (
+            status == 200
+            and body.get("passed") is True
+            and body["normal"]["max_flow"] == 5e-10
+            and body["normal"]["cut"]["capacity"] == 5e-10
+            and body["normal"]["cut"]["cut_edges"][0]["capacity"] == 5e-10
+        )
+        _log(tiny_audit_ok, "合法微小管段（5e-10）审计放行且保留非零最大流/割集",
+             "" if tiny_audit_ok else json.dumps(body, ensure_ascii=False)[:600])
+        ok &= tiny_audit_ok
+
+        status, body = _request("POST", f"{base}/api/plan", PAYLOAD_TINY_PLAN)
+        plans = body.get("plans")
+        tiny_plan_ok = (
+            status == 200
+            and body.get("passed") is True
+            and plans is not None and len(plans) == 1
+            and plans[0]["flow_value"] == 5e-10
+            and plans[0]["flows"][0]["flow"] == 5e-10
+            and plans[0]["flows"][0]["exposure"] == 5e-10
+            and plans[0]["total_cost"] == 5e-10
+            and body["audit"]["normal"]["max_flow"] == 5e-10
+            and body["audit"]["normal"]["cut"]["capacity"] == 5e-10
+        )
+        _log(tiny_plan_ok, "合法微小管段生成唯一配流（总流量/管段流量/总代价均为 5e-10）",
+             "" if tiny_plan_ok else json.dumps(body, ensure_ascii=False)[:600])
+        ok &= tiny_plan_ok
+
+        # 单位暴露代价必须是非负整数
+        status, body = _request("POST", f"{base}/api/plan", PAYLOAD_PLAN_BAD_COST)
+        bad_cost_ok = status == 400 and "非负整数" in body.get("error", "")
+        _log(bad_cost_ok, f"非整数单位暴露代价返回 400（实际 HTTP {status}：{body.get('error', '')}）")
+        ok &= bad_cost_ok
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+
+    return ok
+
+
+def main() -> int:
+    print("==== verify：代码测试 + 构建 + 导排 API 冒烟 ====", flush=True)
+    results = {
+        "tests": run_tests(),
+        "build": run_build(),
+        "smoke": run_smoke(),
+    }
+    print("\n==== 汇总 ====", flush=True)
+    for name, ok in results.items():
+        print(f"  {name:>6}: {'PASS' if ok else 'FAIL'}", flush=True)
+    if all(results.values()):
+        print("verify 全部通过，退出码 0", flush=True)
+        return 0
+    print("verify 存在失败项，退出码 1", flush=True)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

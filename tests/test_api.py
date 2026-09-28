@@ -221,6 +221,47 @@ def test_plan_tiny_legitimate_flow_passes_with_nonzero_evidence():
     assert audit["normal"]["max_flow"] == 5e-10
 
 
+def test_plan_huge_irrelevant_branch_keeps_feasible_draft():
+    """POST /api/plan：1e20 无关支路不影响唯一可行配流，仍 200 + passed=true。"""
+    payload = {
+        "source": "S",
+        "sink": "T",
+        "required_flow": 1,
+        "nodes": ["X"],
+        "edges": [
+            {"id": "E1", "from": "S", "to": "T", "capacity": 1,
+             "maintainable": False, "cost": 1},
+            {"id": "E2", "from": "S", "to": "X", "capacity": 1e20,
+             "maintainable": False, "cost": 0},
+        ],
+    }
+    r = client.post("/api/plan", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["passed"] is True
+    assert body["audit"]["normal"]["max_flow"] == 1
+    assert body["audit"]["normal"]["cut"]["capacity"] == 1
+    plans = body["plans"]
+    assert len(plans) == 1
+    plan = plans[0]
+    assert plan["flow_value"] == 1
+    assert plan["total_cost"] == 1
+    assert [f["flow"] for f in plan["flows"]] == [1, 0]
+    # 同一草稿在 /api/audit 上也放行
+    r2 = client.post("/api/audit", json={
+        "source": "S", "sink": "T", "required_flow": 1, "nodes": ["X"],
+        "edges": [
+            {"id": "E1", "from": "S", "to": "T", "capacity": 1, "maintainable": False},
+            {"id": "E2", "from": "S", "to": "X", "capacity": 1e20, "maintainable": False},
+        ],
+    })
+    assert r2.status_code == 200
+    audit = r2.json()
+    assert audit["passed"] is True
+    assert audit["normal"]["max_flow"] == 1
+    assert audit["normal"]["cut"]["capacity"] == 1
+
+
 def test_plan_missing_cost_400():
     r = client.post("/api/plan", json=PASS_PAYLOAD)  # 审计载荷没有 cost
     assert r.status_code == 400

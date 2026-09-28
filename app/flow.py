@@ -70,15 +70,32 @@ class _Edge:
     # 配对正/反向边共享流量盒：不通过“原容量 − 残余容量”回读已推送
     # 流量——容量远大于推送量时浮点相减会把真实微小流量抹成 0。
     flowbox: list
-    sign: int
+    sign: int  # 正向弧 +1，反向残量弧 −1
+    # 按**本边自身原始容量**缩放的截断阈值。残余容量的浮点尾差只与
+    # 本边容量及经过本边的推送量同量级，与网络中其他跨数量级管段无关：
+    # 容量 1 的管段阈值约 1e-12，容量 1e20 的管段阈值约 1e8。
+    # 不能用全网统一阈值：一条 1e20 的无关大容量支路会把统一阈值抬到
+    # 容量 1 的真实小瓶颈之上，把它的残余容量误判为 0（可行草稿被拒绝，
+    # 且最大流证据与按原始容量汇总的最小割自相矛盾）。
+    edge_tol: float
 
 
 class Dinic:
     """容量为非负实数的有向图 Dinic 最大流。
 
-    ``tol`` 为残余容量截断阈值，按求解规模由调用方通过
-    :func:`residual_tolerance` 计算，避免用固定绝对阈值抹掉
-    量级很小的真实流量。
+    残余容量截断分两级，避免“跨数量级容量并存”时互相误伤：
+
+    * **正向弧**是否可通行按该弧自身容量缩放（``_Edge.edge_tol``）：
+      满载相减产生的 ±容量×ε 尾差恰被本尺度吸收；容量 1 的真实瓶颈
+      不会被网络中 1e20 支路的尺度误伤；
+    * **反向残量弧**额外用流量规模阈值 ``self.tol`` 收紧：小流量网络
+      里大容量管段只可能携带小流量，其反向弧必须保持可通行（改推用），
+      而满载相减尾差只可能出现在推送量已达该容量时，彼时流量规模阈值
+      已不小于本边阈值，不会漏过尾差。
+
+    ``tol`` 为流量规模阈值（增广量累加 / 停机判定 / 反向弧收紧），按
+    求解规模由调用方通过 :func:`residual_tolerance` 给出；无限制求最
+    大流时随已得流量自动放大（真实最大流可能远大于事故需求）。
     """
 
     def __init__(self, n: int, tol: float = RESIDUAL_RTOL):
@@ -89,13 +106,20 @@ class Dinic:
     def add_edge(self, u: int, v: int, cap: float) -> int:
         """添加有向边，返回正向边在 ``g[u]`` 中的下标（便于回读实际流量）。"""
         flowbox = [0.0]
+        edge_tol = residual_tolerance(cap)
         fwd = _Edge(to=v, rev=len(self.g[v]), cap=float(cap),
-                    flowbox=flowbox, sign=1)
+                    flowbox=flowbox, sign=1, edge_tol=edge_tol)
         bak = _Edge(to=u, rev=len(self.g[u]), cap=0.0,
-                    flowbox=flowbox, sign=-1)
+                    flowbox=flowbox, sign=-1, edge_tol=edge_tol)
         self.g[u].append(fwd)
         self.g[v].append(bak)
         return len(self.g[u]) - 1
+
+    def _is_open(self, e: _Edge) -> bool:
+        """残余弧是否可通行：正向按自身容量尺度，反向再受流量规模收紧。"""
+        if e.sign == 1:
+            return e.cap > e.edge_tol
+        return e.cap > e.edge_tol or e.cap > self.tol
 
     def _bfs(self, s: int, t: int) -> list[int]:
         level = [-1] * self.n
@@ -104,7 +128,7 @@ class Dinic:
         while q:
             u = q.popleft()
             for e in self.g[u]:
-                if e.cap > self.tol and level[e.to] < 0:
+                if self._is_open(e) and level[e.to] < 0:
                     level[e.to] = level[u] + 1
                     q.append(e.to)
         return level
@@ -114,9 +138,16 @@ class Dinic:
             return pushed
         while it[u] < len(self.g[u]):
             e = self.g[u][it[u]]
-            if e.cap > self.tol and level[e.to] == level[u] + 1:
+            if self._is_open(e) and level[e.to] == level[u] + 1:
                 got = self._dfs(e.to, t, min(pushed, e.cap), level, it)
-                if got > self.tol:
+                # 能走到这里的增广路每条弧都已通过**按自身容量尺度**的
+                # 残余容量判定（见 _is_open），故任何 got > 0 都是真实
+                # 流量，不能再用全网流量规模阈值丢弃：混合量级网络中
+                # （容量 1 的直连管段与 1e20 通路并存）先探到的小通路
+                # 增量只有 1，丢弃它会跳过仍敞开的弧、破坏 Dinic 当前弧
+                # 的推进不变量。大管段帧上 1e20 − 1 为浮点无害空操作，
+                # 流量盒与反向弧仍须如实登记这 1 个单位。
+                if got > 0.0:
                     e.cap -= got
                     self.g[e.to][e.rev].cap += got
                     e.flowbox[0] += e.sign * got
@@ -128,27 +159,50 @@ class Dinic:
         """求 s→t 最大流；给定 ``limit`` 时流量达到该上限即提前停止。"""
         flow = 0.0
         inf = float("inf")
-        while flow < limit - self.tol:
+        base_tol = self.tol
+        while flow < limit - base_tol:
+            # 无限制求最大流时真实流量可能远大于初始规模（如事故需求 1
+            # 而网络另有 1e20 干线）：随已得流量放大规模阈值，使满载大
+            # 容量管段的反向残量尾差始终被正确截断。该阈值只用于停机
+            # 判定与反向弧收紧，不用于拒绝真实增广（见 _dfs）。
+            self.tol = max(base_tol, residual_tolerance(flow))
             level = self._bfs(s, t)
             if level[t] < 0:
                 return flow
             it = [0] * self.n
-            while flow < limit - self.tol:
+            progressed = False
+            while flow < limit - base_tol:
                 pushed = self._dfs(s, t, min(inf, limit - flow), level, it)
-                if pushed <= self.tol:
-                    break
+                if pushed == 0.0:
+                    break  # 本分层图当前弧耗尽，重建分层
                 flow += pushed
+                progressed = True
+                self.tol = max(base_tol, residual_tolerance(flow))
+            if not progressed:
+                # 理论上 BFS 可达汇点就一定有真实增广（所有入路弧均按
+                # 自身尺度判定为敞开）；此分支仅作浮点异常的防御性兜底。
+                return flow
         return flow
 
-    def reachable_from_source(self, s: int) -> list[bool]:
-        """最大流计算后，沿残余容量 > 0 的边做 BFS，得到源侧节点集合。"""
+    def reachable_from_source(self, s: int, tol: float | None = None) -> list[bool]:
+        """最大流计算后，沿残余容量 > 0 的边做 BFS，得到源侧节点集合。
+
+        ``tol`` 默认为当前**流量规模**阈值（求解结束时的 ``self.tol``），
+        对正 / 反向弧统一适用：必须与“已接受的增广量”同一尺度，割集才
+        是与回报最大流一致的 s→t 割（割容量 == 最大流）。不能用各边自身
+        尺度：大流量已求得后，残余里可能仍有按自身尺度可通行、但相对总
+        流量小于 1e-12 的跨数量级微小通路，沿它会直接抵达汇点并把满载
+        管段的反向弧也串入源侧，得到容量为 0 的退化割集，与最大流证据
+        自相矛盾。
+        """
+        cut_tol = self.tol if tol is None else tol
         seen = [False] * self.n
         seen[s] = True
         q = deque([s])
         while q:
             u = q.popleft()
             for e in self.g[u]:
-                if e.cap > self.tol and not seen[e.to]:
+                if e.cap > cut_tol and not seen[e.to]:
                     seen[e.to] = True
                     q.append(e.to)
         return seen
@@ -288,10 +342,12 @@ def audit_validated_draft(draft: dict) -> dict:
     def _solve(removed_index: Optional[int]) -> tuple[float, dict]:
         """在一张**全新**的网络上独立求最大流，并返回流量与最小割证据。"""
         active = [e for e in clean_edges if e["index"] != removed_index]
-        # 截断阈值按当前网络的流量规模（需求与容量的最大量级）缩放，
-        # 使 5e-10 这类合法微小网络的真实残余容量不会被绝对阈值抹掉。
-        scale = max([required_flow] + [e["capacity"] for e in active])
-        tol = residual_tolerance(scale)
+        # 流量规模阈值只用于增广量累加与达标停机判断，按事故必须持续
+        # 排出量缩放（与配流端 flowplan._solve_plan 一致）；各边残余
+        # 容量是否为零改由该边**自身容量**缩放的阈值独立判定
+        # （见 Dinic.add_edge），故跨数量级的无关大容量支路
+        # （如接入死端节点的 1e20 管段）不会抬高真实小瓶颈的截断尺度。
+        tol = residual_tolerance(required_flow)
         dinic = Dinic(len(all_nodes), tol)
         for e in active:
             dinic.add_edge(index_of[e["from"]], index_of[e["to"]], e["capacity"])

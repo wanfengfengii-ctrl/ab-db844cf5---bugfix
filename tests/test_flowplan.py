@@ -329,6 +329,65 @@ def test_tiny_flow_not_zeroed_even_beside_huge_capacity():
     assert r["plans"][0]["total_cost"] == 5e-10
 
 
+def test_huge_irrelevant_branch_does_not_block_unique_plan():
+    """跨数量级无关支路不影响唯一满足需求的配流（业务结论不变）。
+
+    回归：1e20 死端支路曾抬高审计截断阈值，使正常情形最大流被算成 0，
+    /api/plan 返回 passed=false、plans=null。修复后唯一配流仍是
+    S→T 管段输送 1，总代价 1；零代价无关支路流量为 0。
+    """
+    kw = {
+        "source": "S", "sink": "T", "required_flow": 1, "nodes": ["X"],
+        "edges": [
+            {"id": "E1", "from": "S", "to": "T", "capacity": 1,
+             "maintainable": False, "cost": 1},
+            {"id": "E2", "from": "S", "to": "X", "capacity": 1e20,
+             "maintainable": False, "cost": 0},
+        ],
+    }
+    r = plan_low_exposure(**kw)
+    assert r["passed"] is True
+    audit = r["audit"]
+    assert audit["passed"] is True
+    assert audit["normal"]["max_flow"] == 1
+    assert audit["normal"]["cut"]["capacity"] == 1
+    plans = r["plans"]
+    # 两条管段均不可检修：仅含正常情形一个配流单
+    assert len(plans) == 1 and plans[0]["scenario"] == 0
+    plan = plans[0]
+    flows = _assert_feasible(plan, kw["edges"], 1)
+    assert flows == [1, 0]
+    assert plan["flow_value"] == 1
+    assert plan["total_cost"] == 1
+    assert plan["flows"][0]["flow"] == 1          # 唯一通向 T 的管段满流
+    assert plan["flows"][0]["exposure"] == 1
+    assert plan["flows"][1]["flow"] == 0          # 零代价无关支路不承担流量
+
+
+def test_mixed_scale_routes_split_by_cost():
+    """小容量免费边（0.5）与 1e20 高代价通路并存：跨数量级容量互不误伤。
+
+    免费小边满载 0.5，剩余 0.5 走大容量高代价通路（两条边各 0.5×9）。
+    """
+    kw = {
+        "source": "S", "sink": "T", "required_flow": 1, "nodes": ["A"],
+        "edges": [
+            {"id": "BIG1", "from": "S", "to": "A", "capacity": 1e20,
+             "maintainable": False, "cost": 9},
+            {"id": "BIG2", "from": "A", "to": "T", "capacity": 1e20,
+             "maintainable": False, "cost": 9},
+            {"id": "SMALL", "from": "S", "to": "T", "capacity": 0.5,
+             "maintainable": False, "cost": 0},
+        ],
+    }
+    r = plan_low_exposure(**kw)
+    assert r["passed"] is True
+    plan = r["plans"][0]
+    flows = _assert_feasible(plan, kw["edges"], 1)
+    assert flows == [0.5, 0.5, 0.5]
+    assert plan["total_cost"] == 9
+
+
 def test_integer_valued_float_cost_accepted():
     r = plan_low_exposure(
         source="S", sink="T", nodes=[],

@@ -229,6 +229,110 @@ def test_invalid_inputs_rejected(kwargs, needle):
     assert needle in str(exc.value)
 
 
+def test_huge_irrelevant_branch_does_not_block_feasible_flow():
+    """跨数量级的无关大容量支路不得改变唯一小通路的审计结论。
+
+    回归：截断阈值曾按全网最大单管段容量缩放，接入死端汇合节点的
+    1e20 支路把 tol 抬到 1e8，唯一 S→T 管段（容量 1）的残余容量被
+    误判为 0：最大流被算成 0 而最小割仍是 1，可行草稿被拒绝且流量
+    与割证据自相矛盾。
+    """
+    edges = [
+        {"id": "E1", "from": "S", "to": "T", "capacity": 1, "maintainable": False},
+        {"id": "E2", "from": "S", "to": "X", "capacity": 1e20, "maintainable": False},
+    ]
+    r = audit_network(source="S", sink="T", nodes=["X"], edges=edges, required_flow=1)
+    assert r["passed"] is True
+    assert r["failure"] is None
+    assert r["normal"]["max_flow"] == 1
+    assert r["normal"]["meets"] is True
+    # 最小割仍只含唯一通向 T 的管段，1e20 死端支路不在割集中
+    cut = r["normal"]["cut"]
+    assert cut["capacity"] == 1
+    assert [e["id"] for e in cut["cut_edges"]] == ["E1"]
+    assert "X" in cut["source_side_nodes"]
+    assert "T" in cut["sink_side_nodes"]
+
+
+def test_huge_edges_along_path_with_tiny_internal_bottleneck():
+    """路径两端 1e20、中间瓶颈 1：最大流与最小割只反映真实瓶颈 1。"""
+    edges = [
+        {"id": "E1", "from": "S", "to": "X", "capacity": 1e20, "maintainable": False},
+        {"id": "E2", "from": "X", "to": "Y", "capacity": 1, "maintainable": False},
+        {"id": "E3", "from": "Y", "to": "T", "capacity": 1e20, "maintainable": False},
+    ]
+    r = audit_network(source="S", sink="T", nodes=["X", "Y"],
+                      edges=edges, required_flow=1)
+    assert r["passed"] is True
+    assert r["normal"]["max_flow"] == 1
+    assert r["normal"]["cut"]["capacity"] == 1
+    assert [e["id"] for e in r["normal"]["cut"]["cut_edges"]] == ["E2"]
+
+
+def test_parallel_huge_and_tiny_routes_both_counted():
+    """容量 1 的直连管段与 1e20 通路并联：最大流须为两者之和，割容量一致。
+
+    回归：曾用全网统一阈值，小通路增广量 1 被大流量尺度阈值丢弃，
+    当前弧指针又越过仍敞开的小边，导致最大流被算成 0。
+    """
+    edges = [
+        {"id": "BIG1", "from": "S", "to": "A", "capacity": 1e20, "maintainable": False},
+        {"id": "BIG2", "from": "A", "to": "T", "capacity": 1e20, "maintainable": False},
+        {"id": "SMALL", "from": "S", "to": "T", "capacity": 1, "maintainable": False},
+    ]
+    r = audit_network(source="S", sink="T", nodes=["A"], edges=edges, required_flow=1)
+    assert r["passed"] is True
+    # 浮点下 1e20 + 1 == 1e20，但小通路绝不能让大通路也被丢掉
+    assert r["normal"]["max_flow"] == 1e20
+    assert r["normal"]["cut"]["capacity"] == 1e20
+    # 仅按大通路即可满足 1e20 的大需求（小边先被探到时也不能误杀求解）
+    r_big = audit_network(source="S", sink="T", nodes=["A"], edges=edges,
+                          required_flow=1e20)
+    assert r_big["passed"] is True
+    assert r_big["normal"]["max_flow"] == 1e20
+    assert r_big["normal"]["cut"]["capacity"] == 1e20
+
+
+def test_tiny_route_explored_first_still_finds_huge_route():
+    """录入顺序把容量 1 的直连边排在 1e20 通路之前时，求解结论不变。"""
+    edges = [
+        {"id": "SMALL", "from": "S", "to": "T", "capacity": 1, "maintainable": False},
+        {"id": "BIG1", "from": "S", "to": "A", "capacity": 1e20, "maintainable": False},
+        {"id": "BIG2", "from": "A", "to": "T", "capacity": 1e20, "maintainable": False},
+    ]
+    r = audit_network(source="S", sink="T", nodes=["A"], edges=edges,
+                      required_flow=1e20)
+    assert r["passed"] is True
+    assert r["normal"]["max_flow"] == 1e20
+    assert r["normal"]["cut"]["capacity"] == 1e20
+
+
+def test_huge_irrelevant_branch_without_real_path_still_zero():
+    """对照：只有 1e20 死端支路、不存在 S→T 通路时依旧判 0 不放行。"""
+    edges = [
+        {"id": "E2", "from": "S", "to": "X", "capacity": 1e20, "maintainable": False},
+    ]
+    r = audit_network(source="S", sink="T", nodes=["X"], edges=edges, required_flow=1)
+    assert r["passed"] is False
+    assert r["normal"]["max_flow"] == 0
+    assert r["normal"]["cut"]["capacity"] == 0
+    assert r["failure"]["stage"] == "normal"
+
+
+def test_real_tiny_gap_still_detected_beside_huge_branch():
+    """1e20 无关支路不得掩盖真实微小容量缺口（5e-10）。"""
+    edges = [
+        {"id": "E1", "from": "S", "to": "T", "capacity": 1, "maintainable": False},
+        {"id": "E2", "from": "S", "to": "X", "capacity": 1e20, "maintainable": False},
+    ]
+    r = audit_network(source="S", sink="T", nodes=["X"],
+                      edges=edges, required_flow=1.0000000005)
+    assert r["passed"] is False
+    assert r["normal"]["max_flow"] == 1
+    assert r["normal"]["cut"]["capacity"] == 1
+    assert r["failure"]["stage"] == "normal"
+
+
 def test_cut_capacity_equals_max_flow_normal():
     edges = [
         {"id": "E1", "from": "S", "to": "A", "capacity": 40, "maintainable": True},
